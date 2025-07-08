@@ -1,6 +1,7 @@
 import time
 import sys
 import itertools
+import sympy
 import numpy as np
 import pyomo.environ as pyo
 import gurobipy as gp
@@ -65,9 +66,6 @@ class SpherePartitioning:
         phi_end = np.pi - np.arcsin(self.minimum_distance / 2)
         row_count = 1
         solved = False
-        env = gp.Env(empty=True)
-        env.setParam("OutputFlag", 1)
-        env.start()
         while not solved:
             if use_new_formulation:
                 model = pyo.ConcreteModel()
@@ -109,6 +107,9 @@ class SpherePartitioning:
                     return
                 row_count += 1
             else:
+                env = gp.Env(empty=True)
+                env.setParam("OutputFlag", 1)
+                env.start()
                 model = gp.Model(name="partition", env=env)
                 phi = model.addVars(row_count, lb=0, ub=(phi_end - phi_start), vtype=gp.GRB.CONTINUOUS, name="phi")
                 theta = model.addVar(lb=0, ub=(np.pi / 2), vtype=gp.GRB.CONTINUOUS, name="theta")
@@ -158,6 +159,32 @@ class SpherePartitioning:
     def enumerate_regions(self):
         self.regions = [(i, j) for i in range(self.row_count - 1) for j in range(self.row_length)]
         self.regions.append((self.row_count - 1, 0))
+
+    def partition_satisfies_bound_exactly(self) -> tuple[bool, str]:
+        azimuthal_extent = 2 * np.pi / self.row_length
+        # top spherical cap
+        phi, r_L = sympy.symbols('phi, r_L')
+        top_cap_polar_angle = self.row_starts[0]
+        maximum_top_cap_polar_angle = sympy.functions.elementary.trigonometric.acos(
+            (2 - r_L * r_L) / 2).subs([(phi, top_cap_polar_angle), (r_L, self.minimum_distance)]).evalf()
+        if top_cap_polar_angle > maximum_top_cap_polar_angle:
+            return (False, f"Top cap polar angle of {top_cap_polar_angle} exceeds maximum of {maximum_top_cap_polar_angle}")
+
+        # cells in a row all have the same diameter, so just check one per row
+        for i in range(self.row_count - 1):
+            polar_start = self.row_starts[i]
+            polar_extent = self.row_starts[i + 1] - self.row_starts[i]
+            if not region_diameter_satisfies_bound_exactly(polar_start, polar_extent, azimuthal_extent, self.minimum_distance):
+                return (False, f"Regions in row {i} are too large")
+            
+        # bottom spherical cap
+        bottom_cap_polar_angle = self.row_starts[-1]
+        minimum_bottom_cap_polar_angle = sympy.core.numbers.pi - sympy.functions.elementary.trigonometric.asin(
+            r_L / 2).subs([(r_L, self.minimum_distance)]).evalf()
+        if bottom_cap_polar_angle < minimum_bottom_cap_polar_angle:
+            return (False, f"Bottom cap polar angle of {bottom_cap_polar_angle} below minimum of {minimum_bottom_cap_polar_angle}")
+        
+        return (True, "")
 
     def inequalities_and_bounds_from_partition(self):
         azimuthal_extent = 2 * np.pi / self.row_length
@@ -340,6 +367,19 @@ class SpherePartitioning:
         else:
             exit(f"Solve failed for assignment {assignment} of N = {self.free_electron_count + 1} with status {results.solver.status} and termination condition {results.solver.termination_condition}")
 
+def region_diameter_satisfies_bound_exactly(polar_start: float, polar_extent: float, azimuthal_extent: float, diameter_bound: float) -> bool:
+    """
+    Assumes unit radius
+    """
+    phi_L, phi_bar, theta_bar = sympy.symbols('phi_L, phi_bar, theta_bar')
+    diameter_expression = (1 / sympy.sqrt(2)) * sympy.sqrt(
+        4 - sympy.cos(theta_bar - phi_bar) - 2 * sympy.cos(phi_bar) - sympy.cos(theta_bar + phi_bar)
+        + sympy.cos(theta_bar - phi_bar - 2 * phi_L) - 2 * sympy.cos(phi_bar + 2 * phi_L)
+        + sympy.cos(theta_bar + phi_bar + 2 * phi_L)
+    )
+    diameter = diameter_expression.subs([(phi_L, polar_start), (phi_bar, polar_extent), (theta_bar, azimuthal_extent)])
+    return diameter <= diameter_bound
+
 def angles_to_point(azimuthal_angle: float, polar_angle: float) -> tuple[float]:
     """
     Assumes unit radius
@@ -476,10 +516,10 @@ def calculate_minimum_distance(electron_count: int, putative_minimum_energies: d
     model.obj = pyo.Objective(rule=obj, sense=pyo.minimize)
     model.pprint()
     # baron
-    # opt = pyo.SolverFactory('baron', executable='/usr/local/gamsexp/baron')
-    # start_time = time.time()
-    # results = opt.solve(model, options={'maxtime': budget_seconds}, tee=True, keepfiles=True, symbolic_solver_labels=True)
-    # end_time = time.time()
+    opt = pyo.SolverFactory('baron', executable='/usr/local/gamsexp/baron')
+    start_time = time.time()
+    results = opt.solve(model, options={'maxtime': budget_seconds, 'nodesel': 1}, tee=True, keepfiles=True, symbolic_solver_labels=True)
+    end_time = time.time()
     # scip
     # opt = pyo.SolverFactory('gams', executable='/usr/local/bin/gams')
     # opt.options["solver"] = "scip"
@@ -487,10 +527,10 @@ def calculate_minimum_distance(electron_count: int, putative_minimum_energies: d
     # results = opt.solve(model, tee=True, keepfiles=True, symbolic_solver_labels=True, add_options=['Option optcr = 0;', f'Option reslim={budget_seconds};'])
     # end_time = time.time()
     # gurobi
-    opt = pyo.SolverFactory('gams', executable='/usr/local/bin/gams')
-    start_time = time.time()
-    results = opt.solve(model, tee=True, add_options=['Option optcr = 0;', f'Option reslim={budget_seconds};', 'Option nlp=gurobi;', 'Option threads=1;'])
-    end_time = time.time()
+    # opt = pyo.SolverFactory('gams', executable='/usr/local/bin/gams')
+    # start_time = time.time()
+    # results = opt.solve(model, tee=True, add_options=['Option optcr = 0;', f'Option reslim={budget_seconds};', 'Option nlp=gurobi;', 'Option threads=1;'])
+    # end_time = time.time()
     if results.solver.termination_condition == pyo.TerminationCondition.optimal and end_time - start_time < budget_seconds:
         return np.sqrt(pyo.value(model.obj))
     elif results.solver.status == pyo.SolverStatus.ok:
@@ -512,9 +552,15 @@ if __name__ == "__main__":
     subproblem_solver = sys.argv[2]
     print(f"{electron_count} electrons")
     lower_bound = calculate_minimum_distance(electron_count=electron_count, putative_minimum_energies=putative_minimum_energies, budget_seconds=(40*(electron_count)))
+    print(lower_bound)
     free_electron_count = electron_count - 1
     a = SpherePartitioning(free_electron_count=free_electron_count, minimum_distance=lower_bound)
     print(f"rows = {a.row_count}, row length = {a.row_length}, row starts = {a.row_starts}")
+    partition_valid, partition_error_message = a.partition_satisfies_bound_exactly()
+    if not partition_valid:
+        exit(partition_error_message)
+    else:
+        print("Partition is valid, proceeding...")
     unique_assignments = 0
     total_assignments = 0
     for assignment in itertools.combinations(a.regions, free_electron_count):
